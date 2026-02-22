@@ -1193,7 +1193,7 @@ async function runTests() {
           if (hook.type === 'command') {
             const isNode = hook.command.startsWith('node');
             const isSkillScript = hook.command.includes('/skills/') && (
-              hook.command.startsWith('bash') || hook.command.startsWith('sh') ||
+              /^(bash|sh)\s/.test(hook.command) ||
               hook.command.startsWith('${CLAUDE_PLUGIN_ROOT}/skills/')
             );
             assert.ok(

@@ -45,6 +45,7 @@ GLOBAL_OBSERVATIONS_FILE = HOMUNCULUS_DIR / "observations.jsonl"
 # Thresholds for auto-promotion
 PROMOTE_CONFIDENCE_THRESHOLD = 0.8
 PROMOTE_MIN_PROJECTS = 2
+ALLOWED_INSTINCT_EXTENSIONS = (".yaml", ".yml", ".md")
 
 # Ensure global directories exist (deferred to avoid side effects at import time)
 def _ensure_global_dirs():
@@ -83,6 +84,19 @@ def _validate_file_path(path_str: str, must_exist: bool = False) -> Path:
         raise ValueError(f"Path does not exist: {path}")
 
     return path
+
+
+def _validate_instinct_id(instinct_id: str) -> bool:
+    """Validate instinct IDs before using them in filenames."""
+    if not instinct_id or len(instinct_id) > 128:
+        return False
+    if "/" in instinct_id or "\\" in instinct_id:
+        return False
+    if ".." in instinct_id:
+        return False
+    if instinct_id.startswith("."):
+        return False
+    return bool(re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", instinct_id))
 
 
 # ─────────────────────────────────────────────
@@ -185,8 +199,12 @@ def _update_registry(pid: str, pname: str, proot: str, premote: str) -> None:
     }
 
     REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(REGISTRY_FILE, "w") as f:
+    tmp_file = REGISTRY_FILE.parent / f".{REGISTRY_FILE.name}.tmp.{os.getpid()}"
+    with open(tmp_file, "w") as f:
         json.dump(registry, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_file, REGISTRY_FILE)
 
 
 def load_registry() -> dict:
@@ -248,7 +266,11 @@ def _load_instincts_from_dir(directory: Path, source_type: str, scope_label: str
     instincts = []
     if not directory.exists():
         return instincts
-    for file in directory.glob("*.yaml"):
+    files = [
+        file for file in sorted(directory.iterdir())
+        if file.is_file() and file.suffix.lower() in ALLOWED_INSTINCT_EXTENSIONS
+    ]
+    for file in files:
         try:
             content = file.read_text()
             parsed = parse_instinct_file(content)
@@ -301,7 +323,14 @@ def load_all_instincts(project: dict, include_global: bool = True) -> list[dict]
 
 
 def load_project_only_instincts(project: dict) -> list[dict]:
-    """Load only project-scoped instincts (no global)."""
+    """Load only project-scoped instincts (no global).
+
+    In global fallback mode (no git project), returns global instincts.
+    """
+    if project.get("id") == "global":
+        instincts = _load_instincts_from_dir(GLOBAL_PERSONAL_DIR, "personal", "global")
+        instincts += _load_instincts_from_dir(GLOBAL_INHERITED_DIR, "inherited", "global")
+        return instincts
     return load_all_instincts(project, include_global=False)
 
 
@@ -803,6 +832,10 @@ def cmd_promote(args) -> int:
 
 def _promote_specific(project: dict, instinct_id: str, force: bool) -> int:
     """Promote a specific instinct by ID from current project to global."""
+    if not _validate_instinct_id(instinct_id):
+        print(f"Invalid instinct ID: '{instinct_id}'.", file=sys.stderr)
+        return 1
+
     project_instincts = load_project_only_instincts(project)
     target = next((i for i in project_instincts if i.get('id') == instinct_id), None)
 
@@ -894,6 +927,10 @@ def _promote_auto(project: dict, force: bool, dry_run: bool) -> int:
 
     promoted = 0
     for cand in candidates:
+        if not _validate_instinct_id(cand['id']):
+            print(f"Skipping invalid instinct ID during promotion: {cand['id']}", file=sys.stderr)
+            continue
+
         # Use the highest-confidence version
         best_entry = max(cand['entries'], key=lambda e: e[2].get('confidence', 0.5))
         inst = best_entry[2]
@@ -940,8 +977,8 @@ def cmd_projects(args) -> int:
         personal_dir = project_dir / "instincts" / "personal"
         inherited_dir = project_dir / "instincts" / "inherited"
 
-        personal_count = len(list(personal_dir.glob("*.yaml"))) if personal_dir.exists() else 0
-        inherited_count = len(list(inherited_dir.glob("*.yaml"))) if inherited_dir.exists() else 0
+        personal_count = len(_load_instincts_from_dir(personal_dir, "personal", "project"))
+        inherited_count = len(_load_instincts_from_dir(inherited_dir, "inherited", "project"))
         obs_file = project_dir / "observations.jsonl"
         if obs_file.exists():
             with open(obs_file) as f:
@@ -959,8 +996,8 @@ def cmd_projects(args) -> int:
         print()
 
     # Global stats
-    global_personal = len(list(GLOBAL_PERSONAL_DIR.glob("*.yaml"))) if GLOBAL_PERSONAL_DIR.exists() else 0
-    global_inherited = len(list(GLOBAL_INHERITED_DIR.glob("*.yaml"))) if GLOBAL_INHERITED_DIR.exists() else 0
+    global_personal = len(_load_instincts_from_dir(GLOBAL_PERSONAL_DIR, "personal", "global"))
+    global_inherited = len(_load_instincts_from_dir(GLOBAL_INHERITED_DIR, "inherited", "global"))
     print(f"  GLOBAL")
     print(f"    Instincts: {global_personal} personal, {global_inherited} inherited")
 

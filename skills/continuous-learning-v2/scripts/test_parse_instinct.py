@@ -42,6 +42,8 @@ _promote_specific = _mod._promote_specific
 _promote_auto = _mod._promote_auto
 _find_cross_project_instincts = _mod._find_cross_project_instincts
 load_registry = _mod.load_registry
+_validate_instinct_id = _mod._validate_instinct_id
+_update_registry = _mod._update_registry
 
 
 # ─────────────────────────────────────────────
@@ -463,6 +465,24 @@ def test_load_handles_corrupt_file(tmp_path, capsys):
     assert result[0]["id"] == "test-instinct"
 
 
+def test_load_supports_yml_extension(tmp_path):
+    yml_file = tmp_path / "test.yml"
+    yml_file.write_text(SAMPLE_INSTINCT_YAML)
+
+    result = _load_instincts_from_dir(tmp_path, "personal", "project")
+    ids = {i["id"] for i in result}
+    assert "test-instinct" in ids
+
+
+def test_load_supports_md_extension(tmp_path):
+    md_file = tmp_path / "legacy-instinct.md"
+    md_file.write_text(SAMPLE_INSTINCT_YAML)
+
+    result = _load_instincts_from_dir(tmp_path, "personal", "project")
+    ids = {i["id"] for i in result}
+    assert "test-instinct" in ids
+
+
 # ─────────────────────────────────────────────
 # load_all_instincts tests
 # ─────────────────────────────────────────────
@@ -537,6 +557,27 @@ def test_load_project_only_excludes_global(patch_globals):
     ids = {i["id"] for i in result}
     assert "test-instinct" in ids
     assert "global-instinct" not in ids
+
+
+def test_load_project_only_global_fallback_loads_global(patch_globals):
+    """Global fallback should return global instincts for project-only queries."""
+    tree = patch_globals
+    (tree["global_personal"] / "glob.yaml").write_text(SAMPLE_GLOBAL_INSTINCT_YAML)
+
+    global_project = {
+        "id": "global",
+        "name": "global",
+        "root": "",
+        "project_dir": tree["homunculus"],
+        "instincts_personal": tree["global_personal"],
+        "instincts_inherited": tree["global_inherited"],
+        "evolved_dir": tree["global_evolved"],
+        "observations_file": tree["homunculus"] / "observations.jsonl",
+    }
+
+    result = load_project_only_instincts(global_project)
+    assert len(result) == 1
+    assert result[0]["id"] == "global-instinct"
 
 
 def test_load_all_empty(patch_globals):
@@ -651,6 +692,17 @@ def test_promote_specific_not_found(patch_globals, capsys):
     assert ret == 1
     out = capsys.readouterr().out
     assert "not found" in out
+
+
+def test_promote_specific_rejects_invalid_id(patch_globals, capsys):
+    """Path-like instinct IDs should be rejected before file writes."""
+    tree = patch_globals
+    project = _make_project(tree)
+
+    ret = _promote_specific(project, "../escape", force=True)
+    assert ret == 1
+    err = capsys.readouterr().err
+    assert "Invalid instinct ID" in err
 
 
 def test_promote_specific_already_global(patch_globals, capsys):
@@ -786,6 +838,40 @@ Use descriptive variable names.
     assert "auto-promoted" in content
 
 
+def test_promote_auto_skips_invalid_id(patch_globals, capsys):
+    tree = patch_globals
+
+    p1 = _make_project(tree, pid="proj1", pname="project-one")
+    p2 = _make_project(tree, pid="proj2", pname="project-two")
+
+    bad_id_yaml = """\
+---
+id: ../escape
+trigger: "when coding"
+confidence: 0.9
+domain: general
+scope: project
+---
+
+## Action
+Invalid id should be skipped.
+"""
+    (p1["instincts_personal"] / "bad.yaml").write_text(bad_id_yaml)
+    (p2["instincts_personal"] / "bad.yaml").write_text(bad_id_yaml)
+
+    registry = {
+        "proj1": {"name": "project-one", "root": "/a", "remote": "", "last_seen": "2025-01-01T00:00:00Z"},
+        "proj2": {"name": "project-two", "root": "/b", "remote": "", "last_seen": "2025-01-01T00:00:00Z"},
+    }
+    tree["registry_file"].write_text(json.dumps(registry))
+
+    ret = _promote_auto(p1, force=True, dry_run=False)
+    assert ret == 0
+    err = capsys.readouterr().err
+    assert "Skipping invalid instinct ID" in err
+    assert not (tree["global_personal"] / "../escape.yaml").exists()
+
+
 # ─────────────────────────────────────────────
 # _find_cross_project_instincts tests
 # ─────────────────────────────────────────────
@@ -852,3 +938,19 @@ def test_load_registry_valid(patch_globals):
     tree["registry_file"].write_text(json.dumps(data))
     result = load_registry()
     assert result == data
+
+
+def test_validate_instinct_id():
+    assert _validate_instinct_id("good-id_1.0")
+    assert not _validate_instinct_id("../bad")
+    assert not _validate_instinct_id("bad/name")
+    assert not _validate_instinct_id(".hidden")
+
+
+def test_update_registry_atomic_replaces_file(patch_globals):
+    tree = patch_globals
+    _update_registry("abc123", "demo", "/repo", "https://example.com/repo.git")
+    data = json.loads(tree["registry_file"].read_text())
+    assert "abc123" in data
+    leftovers = list(tree["registry_file"].parent.glob(".projects.json.tmp.*"))
+    assert leftovers == []
